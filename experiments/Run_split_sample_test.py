@@ -52,20 +52,25 @@ def generate_synthetic(p=20, k=3, n=40, dense=True, b_prob=0.2, noise_std=0.1, s
     return X, B_true, Z_true, L, U
 
 
-def solve_miqp(X, L, U, time_limit=300, mip_gap=1e-4, threads=0, verbose=True):
+def solve_miqp_binary_relaxed(X, L, U, n1,
+                             time_limit=300, mip_gap=1e-4, threads=0, verbose=True):
     """
-    Solve the MIQP:
-      min_{B,Z,w,S} sum_{i,j} (X_ij - S_ij)^2
-      s.t. S_ij = sum_l U_ilj
-           w_ilj linearized for B_il * Z_lj via mc1-mc4
-           L_il <= B_il <= U_il
-           Z_lj binary
+    Solve MIQP with:
+      - Z_{l,j} binary for j=0,...,n1-1  (identifiability block)
+      - Z_{l,j} continuous in [0,1] for j=n1,...,n-1 (accuracy block)
+
+    Returns:
+      B_hat: (p,k) float
+      Z_hat: (k,n) float   (first n1 columns ~{0,1}, rest in [0,1])
+      S_hat: (p,n) float
+      info: dict
     """
     p, n = X.shape
     p2, k = L.shape
     assert p2 == p and U.shape == (p, k)
+    assert 0 <= n1 <= n
 
-    m = gp.Model("binary_latent_miqp")
+    m = gp.Model("binary_relaxed_latent_miqp")
     if not verbose:
         m.Params.OutputFlag = 0
     if time_limit is not None:
@@ -75,68 +80,67 @@ def solve_miqp(X, L, U, time_limit=300, mip_gap=1e-4, threads=0, verbose=True):
     if threads is not None and threads > 0:
         m.Params.Threads = threads
 
-    # Decision variables
-    # B_{i,l} in [L_{i,l}, U_{i,l}]
-    B = m.addMVar((p, k), lb=-1, ub=1,
-                 vtype=GRB.CONTINUOUS, name="B")
+    # B in [L,U]
+    B = m.addMVar((p, k), lb=-1, ub=1, vtype=GRB.CONTINUOUS, name="B")
 
-    # Z_{l,j} binary
-    Z = m.addVars(k, n, vtype=GRB.BINARY, name="Z")
+    # Z split
+    Zb = m.addVars(k, n1, vtype=GRB.BINARY, name="Zb")
+    Zc = m.addVars(k, n - n1, lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS, name="Zc")
 
-    # w_{i,l,j} continuous (represents B_{i,l} * Z_{l,j})
-    # Optional tightening: since Z is 0/1 and B in [L,U], w is in [min(0,L), max(0,U)]
-    # but we'll just leave it free; you can add bounds if you want.
+    def Z(l, j):
+        return Zb[l, j] if j < n1 else Zc[l, j - n1]
+
+    # w = B * Z (McCormick)
     w = m.addVars(p, k, n, lb=-1, vtype=GRB.CONTINUOUS, name="U")
 
-    # S_{i,j} continuous (represents (B Z)_{i,j})
-    S = m.addVars(p, n, lb=np.min(L)*n, vtype=GRB.CONTINUOUS, name="S")
+    # S = sum_l w
+    S = m.addVars(p, n, lb=float(np.min(L)) * n, vtype=GRB.CONTINUOUS, name="S")
 
-    # Constraints: S_{i,j} = sum_l U_{i,l,j}
     m.addConstrs(
         (S[i, j] == gp.quicksum(w[i, l, j] for l in range(k))
          for i in range(p) for j in range(n)),
         name="S_def"
     )
 
-    # McCormick / big-M linearization (mc1-mc4)
-    # U_{i,l,j} <= U_{i,l} * Z_{l,j}
+    # McCormick / big-M: valid for Z in [0,1] too
     m.addConstrs(
-        (w[i, l, j] <= float(U[i, l]) * Z[l, j]
+        (w[i, l, j] <= float(U[i, l]) * Z(l, j)
          for i in range(p) for l in range(k) for j in range(n)),
         name="mc1"
     )
-    # U_{i,l,j} >= L_{i,l} * Z_{l,j}
     m.addConstrs(
-        (w[i, l, j] >= float(L[i, l]) * Z[l, j]
+        (w[i, l, j] >= float(L[i, l]) * Z(l, j)
          for i in range(p) for l in range(k) for j in range(n)),
         name="mc2"
     )
-    # U_{i,l,j} <= B_{i,l} - L_{i,l} (1 - Z_{l,j})
     m.addConstrs(
-        (w[i, l, j] <= B[i, l] - float(L[i, l]) * (1 - Z[l, j])
+        (w[i, l, j] <= B[i, l] - float(L[i, l]) * (1 - Z(l, j))
          for i in range(p) for l in range(k) for j in range(n)),
         name="mc3"
     )
-    # U_{i,l,j} >= B_{i,l} - U_{i,l} (1 - Z_{l,j})
     m.addConstrs(
-        (w[i, l, j] >= B[i, l] - float(U[i, l]) * (1 - Z[l, j])
+        (w[i, l, j] >= B[i, l] - float(U[i, l]) * (1 - Z(l, j))
          for i in range(p) for l in range(k) for j in range(n)),
         name="mc4"
     )
 
-    # Objective: sum_{i,j} (X_ij - S_ij)^2
     obj = gp.quicksum((float(X[i, j]) - S[i, j]) * (float(X[i, j]) - S[i, j])
                       for i in range(p) for j in range(n))
     m.setObjective(obj, GRB.MINIMIZE)
-
     m.optimize()
 
     if m.Status not in [GRB.OPTIMAL, GRB.TIME_LIMIT, GRB.SUBOPTIMAL]:
         raise RuntimeError(f"Gurobi ended with status {m.Status}")
 
-    # Extract solution
     B_hat = np.array([[B[i, l].X for l in range(k)] for i in range(p)], dtype=float)
-    Z_hat = np.array([[int(round(Z[l, j].X)) for j in range(n)] for l in range(k)], dtype=int)
+
+    Z_hat = np.zeros((k, n), dtype=float)
+    for l in range(k):
+        for j in range(n1):
+            Z_hat[l, j] = Zb[l, j].X
+        for j in range(n1, n):
+            Z_hat[l, j] = Zc[l, j - n1].X
+
     S_hat = np.array([[S[i, j].X for j in range(n)] for i in range(p)], dtype=float)
 
     info = {
@@ -147,6 +151,7 @@ def solve_miqp(X, L, U, time_limit=300, mip_gap=1e-4, threads=0, verbose=True):
         "node_count": m.NodeCount,
     }
     return B_hat, Z_hat, S_hat, info
+
 
 
 
@@ -278,59 +283,61 @@ def tpr_fpr_f1(Z_hat, Z_true, eps=1e-12):
         "FN": FN
     }
 
+def tpr_fpr_f1_first_block(Z_hat_aligned, Z_true, n1, eps=1e-12):
+    Zh = np.rint(Z_hat_aligned[:, :n1]).astype(int)   # should already be near 0/1
+    Zt = Z_true[:, :n1].astype(int)
+    return tpr_fpr_f1(Zh, Zt, eps=eps)
+
+
 
 
 results = []
-for p in [20, 50, 100]:
-# for p in [50]:
+for p in [50]:
+# for p in [20]:
     for k in [1, 2, 3]:
     # for k in [2]:
-        for n in [2*k, 4*k, 8*k, 16*k, 32*k]:
-        # for n in [2*k]:
-            # p, k, n = 50, 1, 10
-            X, B_true, Z_true, L, U = generate_synthetic(
-                p=p, k=k, n=n,
-                dense=False,
-                noise_std=0.10,
-                seed=1,
-                L_val=-1.0, U_val=1.0,
-                z_prob=0.3
-            )
+        for n in [50]:
+        # for n in [8*k]:
+            for n1 in [4*k, 6*k, 8*k, 10*k, n]:
+                # p, k, n = 50, 1, 10
+                X, B_true, Z_true, L, U = generate_synthetic(
+                    p=p, k=k, n=n,
+                    dense=False,
+                    noise_std=0.10,
+                    seed=1,
+                    L_val=-1.0, U_val=1.0,
+                    z_prob=0.3
+                )
+                B_hat, Z_hat, S_hat, info = solve_miqp_binary_relaxed(
+                    X, L, U, n1=n1, time_limit=600, mip_gap=1e-4, threads=8, verbose=True
+                )
 
-            B_hat, Z_hat, S_hat, info = solve_miqp(
-                X, L, U,
-                time_limit=120,   # seconds
-                mip_gap=1e-4,
-                threads=8,
-                verbose=True
-            )
+                perm, B_hat_aligned, score = best_permutation_align_B(B_true, B_hat, metric="fro")
+                Z_hat_aligned = apply_perm_to_Z(Z_hat, perm)
 
-            perm, B_hat_aligned, score = best_permutation_align_B(B_true, B_hat, metric="fro")
-            Z_hat_aligned = apply_perm_to_Z(Z_hat, perm)
+                metrics = eval_B(B_true, B_hat_aligned)
+                print("best perm:", perm)
+                print("alignment score:", score)
+                # print(metrics)
 
-            metrics = eval_B(B_true, B_hat_aligned)
-            print("best perm:", perm)
-            print("alignment score:", score)
-            # print(metrics)
+                # metrics for Z
+                Z_metrics = tpr_fpr_f1_first_block(Z_hat_aligned, Z_true, n1=n1)
+                print(Z_metrics)
 
-            # metrics for Z
-            Z_metrics = tpr_fpr_f1(Z_hat_aligned, Z_true)
-            print(Z_metrics)
+                # Basic diagnostics (note: B,Z identifiable only up to column permutations in general)
+                recon_err = np.linalg.norm(X - S_hat, ord="fro")
+                print("\n=== Solve info ===")
+                print(info)
+                print(f"Frobenius reconstruction ||X - BZ||_F/(n*p) (via S_hat): {recon_err/(n*p):.6f}")
 
-            # Basic diagnostics (note: B,Z identifiable only up to column permutations in general)
-            recon_err = np.linalg.norm(X - S_hat, ord="fro")
-            print("\n=== Solve info ===")
-            print(info)
-            print(f"Frobenius reconstruction ||X - BZ||_F/(n*p) (via S_hat): {recon_err/(n*p):.6f}")
-
-            # If you just want to see raw comparisons (not permutation-aligned):
-            print("\nB_true (first 3 rows):\n", B_true[:3])
-            print("\nB_hat  (first 3 rows):\n", B_hat_aligned[:3])
-            print("\nZ_true (first 3 rows):\n", Z_true[:3])
-            print("\nZ_hat  (first 3 rows):\n", Z_hat_aligned[:3])
-            results.append([p, k, n, info['mip_gap'], info['runtime_sec'], recon_err/(n*p), Z_metrics['TPR'], Z_metrics['FPR']])
-            df = pd.DataFrame(results, columns=['p', 'k', 'n', 'rgap', 'time', '||X - BZ||_F/(n*p)', 'TPR', 'FPR'])
-            print(df)
-            df.to_csv(f"{current_dir}/../experiment_results/required_sample_results.csv")
+                # If you just want to see raw comparisons (not permutation-aligned):
+                print("\nB_true (first 3 rows):\n", B_true[:3])
+                print("\nB_hat  (first 3 rows):\n", B_hat_aligned[:3])
+                print("\nZ_true (first 3 rows):\n", Z_true)
+                print("\nZ_hat  (first 3 rows):\n", Z_hat_aligned[:3])
+                results.append([p, k, n, n1, info['mip_gap'], info['runtime_sec'], recon_err/(n*p), Z_metrics['TPR'], Z_metrics['FPR']])
+                df = pd.DataFrame(results, columns=['p', 'k', 'n', 'n1', 'rgap', 'time', '||X - BZ||_F/(n*p)', 'TPR', 'FPR'])
+                print(df)
+                df.to_csv(f"{current_dir}/../experiment_results/split_sample_results.csv")
 
 
