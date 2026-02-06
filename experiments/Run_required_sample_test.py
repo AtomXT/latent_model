@@ -281,12 +281,12 @@ def tpr_fpr_f1(Z_hat, Z_true, eps=1e-12):
 
 
 results = []
-# for p in [20, 50, 100]:
-for p in [50]:
-    # for k in [1, 2, 3]:
-    for k in [2]:
-        # for n in [2*k, 4*k, 8*k, 16*k, 32*k]:
-        for n in [2*k]:
+for p in [20, 50, 100]:
+# for p in [50]:
+    for k in [1, 2, 3]:
+    # for k in [2]:
+        for n in [2*k, 4*k, 8*k, 16*k, 32*k]:
+        # for n in [2*k]:
             # p, k, n = 50, 1, 10
             X, B_true, Z_true, L, U = generate_synthetic(
                 p=p, k=k, n=n,
